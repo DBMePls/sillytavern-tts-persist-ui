@@ -1,0 +1,10 @@
+{
+  "display_name": "TTS Persist",
+  "version": "3.2.0",
+  "js": "index.js",
+  "css": "style.css",
+  "author": "DBMePls",
+  "description": "Persistent TTS: Server-side storage, stable IDs, swipe support, replay from any device.",
+  "homePage": "https://github.com/DBMePls/sillytavern-tts-persist-ui",
+  "auto_update": true
+}
