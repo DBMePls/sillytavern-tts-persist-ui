@@ -1,5 +1,5 @@
 /**
- * TTS Persist — Extension v7.9.1 (Smart Header Parser & Unified Group/Persona Clearing)
+ * TTS Persist — Extension v8.2.0 (High-Efficiency Server Eager Stashing)
  * Place folder at: SillyTavern/public/extensions/third-party/tts-persist/
  */
 
@@ -9,26 +9,18 @@ import { extension_settings, getContext } from '/scripts/extensions.js';
 const EXT = 'tts_persist';
 const API = '/api/plugins/tts-persist';
 
-// ── Queue Usurper & Network Traffic Controllers ──────────────────────────────
 let queueServingChatId = null;
 let globalAbortController = new AbortController();
 
-// ── SillyTavern API Wrapper ──────────────────────────────────────────────────
 async function apiFetch(url, options = {}) {
     const headers = new Headers(options.headers || {});
-    
     if (typeof getRequestHeaders === 'function') {
         const stHeaders = getRequestHeaders();
-        for (const [key, value] of Object.entries(stHeaders)) {
-            headers.set(key, value);
-        }
+        for (const [key, value] of Object.entries(stHeaders)) headers.set(key, value);
     }
-
     options.credentials = 'include'; 
     return fetch(url, { ...options, headers });
 }
-
-// ── Settings ─────────────────────────────────────────────────────────────────
 
 const DEFAULTS = {
     enabled:           true,
@@ -37,17 +29,13 @@ const DEFAULTS = {
     batchSkipLast:     2, 
     deleteOnEdit:      true,
     keepSwipeAudio:    true,
-
     collapseOnMobile: true,
     collapseOnPc:     false,
-
     narrateUserMessages:             false,
     streamManualPlayback:            true,
     chunkBackgroundRequests:         true,
-    
     chunkMinLength:                  0,
     chunkSilenceSeconds:             0,
-
     onlyNarrateQuotes:               false,
     ignoreAsterisksText:             false,
     narrateOnlyTranslated:           false,
@@ -57,9 +45,7 @@ const DEFAULTS = {
     differentVoicesForSegments:      false,
     applyRegexFilter:                false,
     regexPattern:                    '',
-
     audioPlaybackSpeed: 1.0,
-
     ttsEndpoint:     'http://127.0.0.1:7851/v1/audio/speech',
     ttsApiKey:       'sk-none',
     ttsModel:        'vibevoice/VibeVoice-1.5B',
@@ -71,7 +57,6 @@ const DEFAULTS = {
     ttsFormat:       'pcm', 
     ttsInstructions: '',
     extraParams:     '{}',
-
     availableVoices:    '',   
     characterVoices:    {},   
 };
@@ -79,117 +64,21 @@ const DEFAULTS = {
 function getSettings() {
     if (!extension_settings[EXT]) extension_settings[EXT] = {};
     for (const key of Object.keys(DEFAULTS)) {
-        if (extension_settings[EXT][key] === undefined) {
-            extension_settings[EXT][key] = DEFAULTS[key];
-        }
+        if (extension_settings[EXT][key] === undefined) extension_settings[EXT][key] = DEFAULTS[key];
     }
     return extension_settings[EXT];
 }
 
 function saveSettings() { saveSettingsDebounced(); }
 
-// ── Audio Converters & Cleaners ───────────────────────────────────────────────
-
-async function detectFormatClient(blob, requestedFormat) {
-    if (blob.size < 4) return requestedFormat;
-    const arr = new Uint8Array(await blob.slice(0, 4).arrayBuffer());
-    const sig = (arr[0]<<24) | (arr[1]<<16) | (arr[2]<<8) | arr[3];
-    if (sig === 0x52494646) return 'wav';
-    if (sig === 0x4f676753) return 'opus';
-    if (sig === 0x664c6143) return 'flac';
-    if (sig === 0x49443303 || sig === 0x49443304 || (sig & 0xFFE00000) === 0xFFE00000) return 'mp3';
-    return requestedFormat;
-}
-
-function extractPcmFromWavArrayBuffer(arr) {
-    const view = new DataView(arr);
-    const uint8 = new Uint8Array(arr);
-    try {
-        if (uint8.length < 12 || view.getUint32(0, false) !== 0x52494646) return { pcm: uint8.length > 44 ? uint8.slice(44) : uint8, sampleRate: 24000 };
-        let offset = 12;
-        let sampleRate = 24000;
-        while (offset < uint8.length - 8) {
-            const chunkId = view.getUint32(offset, false);
-            const chunkSize = view.getUint32(offset + 4, true);
-            if (chunkId === 0x666d7420) { // 'fmt '
-                sampleRate = view.getUint32(offset + 12, true);
-            }
-            if (chunkId === 0x64617461) { // 'data'
-                return { pcm: uint8.slice(offset + 8, offset + 8 + chunkSize), sampleRate };
-            }
-            offset += 8 + (chunkSize % 2 === 0 ? chunkSize : chunkSize + 1);
-        }
-    } catch(e) {}
-    return { pcm: uint8.length > 44 ? uint8.slice(44) : uint8, sampleRate: 24000 };
-}
-
-function cleanMp3Data(uint8Arr) {
-    let offset = 0;
-    if (uint8Arr.length > 10 && uint8Arr[0] === 0x49 && uint8Arr[1] === 0x44 && uint8Arr[2] === 0x33) {
-        const size = (uint8Arr[6] << 21) | (uint8Arr[7] << 14) | (uint8Arr[8] << 7) | uint8Arr[9];
-        offset = 10 + size;
-    }
-    let data = offset > 0 ? uint8Arr.slice(offset) : uint8Arr;
-    
-    if (data.length >= 128) {
-        const end = data.length - 128;
-        if (data[end] === 0x54 && data[end+1] === 0x41 && data[end+2] === 0x47) {
-            data = data.slice(0, end);
-        }
-    }
-    const scanLimit = Math.min(data.length, 8192);
-    for (let i = 0; i < scanLimit - 4; i++) {
-        if (
-            (data[i] === 0x58 && data[i+1] === 0x69 && data[i+2] === 0x6E && data[i+3] === 0x67) || 
-            (data[i] === 0x49 && data[i+1] === 0x6E && data[i+2] === 0x66 && data[i+3] === 0x6F)    
-        ) {
-            data[i] = 0; data[i+1] = 0; data[i+2] = 0; data[i+3] = 0;
-            break;
-        }
-    }
-    return data;
-}
-
-async function createWavBlob(pcmDataBlob, { sampleRate, bitDepth, numChannels }) {
-    const pcmData = await pcmDataBlob.arrayBuffer();
-    const pcmDataSize = pcmData.byteLength;
-    const blockAlign = numChannels * (bitDepth / 8);
-    const byteRate = sampleRate * blockAlign;
-    const buffer = new ArrayBuffer(44 + pcmDataSize);
-    const view = new DataView(buffer);
-
-    function writeString(view, offset, string) {
-        for (let i = 0; i < string.length; i++) view.setUint8(offset + i, string.charCodeAt(i));
-    }
-
-    writeString(view, 0, 'RIFF'); view.setUint32(4, 36 + pcmDataSize, true);
-    writeString(view, 8, 'WAVE'); writeString(view, 12, 'fmt ');
-    view.setUint32(16, 16, true); view.setUint16(20, 1, true); 
-    view.setUint16(22, numChannels, true); view.setUint32(24, sampleRate, true);
-    view.setUint32(28, byteRate, true); view.setUint16(32, blockAlign, true);
-    view.setUint16(34, bitDepth, true); writeString(view, 36, 'data');
-    view.setUint32(40, pcmDataSize, true);
-
-    new Uint8Array(buffer, 44).set(new Uint8Array(pcmData));
-    return new Blob([view], { type: 'audio/wav' });
-}
-
-// ── Stable ID helpers ─────────────────────────────────────────────────────────
-
-function dateKey(sendDate) {
-    return String(sendDate).replace(/[^a-zA-Z0-9]/g, '_').substring(0, 32);
-}
-
+function dateKey(sendDate) { return String(sendDate).replace(/[^a-zA-Z0-9]/g, '_').substring(0, 32); }
 function textHash(str) {
     let h = 5381;
     for (let i = 0; i < str.length; i++) h = ((h << 5) + h) ^ str.charCodeAt(i);
     return (h >>> 0).toString(36);
 }
 
-// ── Native 1:1 Text Preprocessing ─────────────────────────────────────────────
-
 function escapeRegex(string) { return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
-
 function regexFromString(string) {
     const match = /^\/(.*)\/([a-z]*)$/.exec(string);
     if (match) { try { return new RegExp(match[1], match[2]); } catch (e) { return null; } }
@@ -220,19 +109,10 @@ function preprocessText(rawText, msg, charName) {
     let t = c.narrateOnlyTranslated ? (msg?.extra?.translate || msg?.extra?.display_text || rawText) : rawText;
 
     if (typeof substituteParams === 'function') t = substituteParams(t);
-    
-    t = t.replace(/<img[^>]+>/gi, ''); 
-    t = t.replace(/!\[.*?]\([^)]*\)/g, ''); 
-    t = t.replace(/\[\s*IMG:\s*([^\]]*?)\s*\]/gi, ''); 
-
+    t = t.replace(/<img[^>]+>/gi, ''); t = t.replace(/!\[.*?]\([^)]*\)/g, ''); t = t.replace(/\[\s*IMG:\s*([^\]]*?)\s*\]/gi, ''); 
     if (c.skipCodeblocks) t = t.replace(/```[\s\S]*?```/gs, '').replace(/~~~[\s\S]*?~~~/gs, '');
-    if (c.skipTaggedBlocks) {
-        t = t.replace(/<.*?>[\s\S]*?<\/.*?>/g, ''); 
-        t = t.replace(/<[^>]+>/g, ''); 
-    }
-    
+    if (c.skipTaggedBlocks) { t = t.replace(/<.*?>[\s\S]*?<\/.*?>/g, ''); t = t.replace(/<[^>]+>/g, ''); }
     if (!c.passAsterisksToTTS) t = c.ignoreAsterisksText ? t.replace(/\*[^*]*?(\*|$)/g, '') : t.replaceAll('*', '');
-    
     if (c.applyRegexFilter && c.regexPattern) {
         const patterns = c.regexPattern.split('\n').filter(p => p.trim());
         for (const p of patterns) {
@@ -240,17 +120,14 @@ function preprocessText(rawText, msg, charName) {
             if (regex) t = t.replace(regex, ' ').trim();
         }
     }
-    
     if (c.onlyNarrateQuotes) t = joinQuotedBlocks(t, { separator: ' ... ', includeQuotes: true });
 
     t = t.replace(/[ \t]+/g, ' ').replace(/\n+/g, '\n').trim();
-
     const pu = window.power_user || {};
     if (charName && !pu.allow_name2_display) {
         const escapedChar = escapeRegex(charName);
         t = t.replace(new RegExp(`^${escapedChar}:`, 'gm'), '');
     }
-
     return t.trim();
 }
 
@@ -275,49 +152,34 @@ function parseMessageSegments(text) {
         if (otherText) segments.push({ type: 'other', text: otherText });
     }
     if (!segments.length && text.trim()) segments.push({ type: 'other', text: text.trim() });
-    
     return segments;
 }
 
 function smartSplitParagraphs(text, minLength = 0) {
     const lines = text.split('\n').map(p => p.trim()).filter(Boolean);
     if (minLength <= 0) return lines;
-    
     const merged = [];
     let current = "";
-    
     for (const line of lines) {
-        if (!current) {
-            current = line;
-        } else {
-            current += " " + line; 
-        }
-        
-        if (current.length >= minLength) {
-            merged.push(current);
-            current = "";
-        }
+        if (!current) current = line; else current += " " + line; 
+        if (current.length >= minLength) { merged.push(current); current = ""; }
     }
     if (current) merged.push(current); 
     return merged;
 }
 
-// ── Voice helpers ─────────────────────────────────────────────────────────────
 function getVoiceForChar(charName, segmentType = 'other') {
     const c = getSettings();
     let voice = '';
-    
     if (c.differentVoicesForSegments) {
         if (segmentType === 'dialogue' && c.ttsVoiceQuotes) voice = c.ttsVoiceQuotes;
         else if (segmentType === 'action' && c.ttsVoiceAsterisks) voice = c.ttsVoiceAsterisks;
         else if (segmentType === 'other' && c.ttsVoiceNarration) voice = c.ttsVoiceNarration;
     }
-    
     if (!voice) {
         const voices = c.characterVoices || {};
         voice = (charName && voices[charName]) ? voices[charName] : c.ttsVoice;
     }
-    
     return voice || '';
 }
 
@@ -334,7 +196,6 @@ function voiceLangCode(voiceName) {
     return 'en-US';
 }
 
-// ── Cache & Context ───────────────────────────────────────────────────────────
 const keyCache = new Map();
 function cacheSet(mesid, data) { keyCache.set(Number(mesid), data); }
 function cacheGet(mesid) { return keyCache.get(Number(mesid)); }
@@ -360,7 +221,6 @@ function getMsgInfo(mesEl) {
     const swipeId = msg.swipe_id ?? 0;
     const rawText = (msg.swipes?.[swipeId]) ?? msg.mes ?? '';
     
-    // Properly grab historical names for User or Persona
     const charName = msg.name || (isUser ? (context.name1 || 'User') : (context.name2 || 'unknown'));
     const chatId = context.chatId;
     const dk = dateKey(msg.send_date);
@@ -369,22 +229,15 @@ function getMsgInfo(mesEl) {
     return { mesid, swipeId, rawText, msg, charName, chatId, dk, akBase, isUser };
 }
 
-// ── HYBRID ROUTING (EAGER vs BACKGROUND) ──────────────────────────────────────
-
 const pendingServerJobs = new Map(); 
 
 function requestGeneration(info, isManual) {
     if (info.isUser && !getSettings().narrateUserMessages) return;
-
     const currentActiveChat = ctx().chatId;
-    if (info.chatId !== currentActiveChat && currentActiveChat !== undefined) {
-        return; 
-    }
+    if (info.chatId !== currentActiveChat && currentActiveChat !== undefined) return; 
 
     if (getSettings().abortOnChatChange && queueServingChatId !== info.chatId) {
-        if (queueServingChatId !== null) {
-            clearAllQueuesSyncAndFire();
-        }
+        if (queueServingChatId !== null) clearAllQueuesSyncAndFire();
         queueServingChatId = info.chatId;
     } else if (!queueServingChatId) {
         queueServingChatId = info.chatId;
@@ -394,25 +247,17 @@ function requestGeneration(info, isManual) {
     const testVoice = getVoiceForChar(info.charName, 'other');
     if (!testVoice || testVoice.toLowerCase() === 'none' || testVoice.toLowerCase() === 'disabled') {
         playerStatus(info.playerEl, 'no-audio', `No voice configured for ${info.charName}`);
-        if (isManual && window.toastr) {
-            toastr.warning(`No voice assigned for ${info.charName}. Please set one in the TTS Persist settings.`);
-        }
+        if (isManual && window.toastr) toastr.warning(`No voice assigned for ${info.charName}. Please set one in the TTS Persist settings.`);
         return; 
     }
 
     let useEagerStreaming = false;
-
     if (isManual) {
-        if (c.differentVoicesForSegments || (!info.isUser && c.streamManualPlayback)) {
-            useEagerStreaming = true;
-        }
+        if (c.differentVoicesForSegments || (!info.isUser && c.streamManualPlayback)) useEagerStreaming = true;
     }
 
-    if (useEagerStreaming) {
-        startEagerStreaming(info);
-    } else {
-        startServerQueue(info, isManual);
-    }
+    if (useEagerStreaming) startEagerStreaming(info);
+    else startServerQueue(info, isManual);
 }
 
 // ── 1. BACKGROUND SERVER ENGINE ───────────────────────────────────────────────
@@ -422,11 +267,7 @@ async function startServerQueue(info, isPriority) {
     
     const c = getSettings();
     let textToProcess = preprocessText(info.rawText, info.msg, info.charName);
-    
-    if (!textToProcess) {
-        playerStatus(info.playerEl, 'no-audio', 'Text empty after filters');
-        return;
-    }
+    if (!textToProcess) { playerStatus(info.playerEl, 'no-audio', 'Text empty after filters'); return; }
 
     const usePara = info.isUser ? false : c.chunkBackgroundRequests;
     const chunks = usePara ? smartSplitParagraphs(textToProcess, c.chunkMinLength) : [textToProcess];
@@ -440,10 +281,7 @@ async function startServerQueue(info, isPriority) {
         });
     });
     
-    if (finalInputs.length === 0) {
-        playerStatus(info.playerEl, 'no-audio', 'Text empty after filters');
-        return;
-    }
+    if (finalInputs.length === 0) { playerStatus(info.playerEl, 'no-audio', 'Text empty after filters'); return; }
     
     let extra = {}; try { extra = JSON.parse(c.extraParams || '{}'); } catch {}
 
@@ -492,14 +330,9 @@ let eagerAbortController = null;
 let currentEagerChunkJob = null;
 
 const eagerAudioElement = new Audio();
-eagerAudioElement.addEventListener('play', () => {
-    if (eagerAudioElement._linkedPlayBtn) eagerAudioElement._linkedPlayBtn.textContent = '⏸';
-});
-eagerAudioElement.addEventListener('pause', () => {
-    if (eagerAudioElement._linkedPlayBtn) eagerAudioElement._linkedPlayBtn.textContent = '▶';
-});
+eagerAudioElement.addEventListener('play', () => { if (eagerAudioElement._linkedPlayBtn) eagerAudioElement._linkedPlayBtn.textContent = '⏸'; });
+eagerAudioElement.addEventListener('pause', () => { if (eagerAudioElement._linkedPlayBtn) eagerAudioElement._linkedPlayBtn.textContent = '▶'; });
 
-// UI progress bar hook for Eager streaming mode
 eagerAudioElement.addEventListener('timeupdate', () => {
     const job = Array.from(activeEagerJobs.values()).find(j => j.isPlaying);
     if (!job || !job.playerEl) return;
@@ -523,11 +356,7 @@ async function startEagerStreaming(info) {
     
     const c = getSettings();
     let textToProcess = preprocessText(info.rawText, info.msg, info.charName);
-    
-    if (!textToProcess) {
-        playerStatus(info.playerEl, 'no-audio', 'Text empty after filters');
-        return;
-    }
+    if (!textToProcess) { playerStatus(info.playerEl, 'no-audio', 'Text empty after filters'); return; }
     
     const usePara = info.isUser ? false : c.streamManualPlayback;
     const chunks = usePara ? smartSplitParagraphs(textToProcess, c.chunkMinLength) : [textToProcess];
@@ -551,22 +380,14 @@ async function startEagerStreaming(info) {
             if (cleanText) {
                 parentJob.totalChunks++;
                 parentJob.pendingChunks++;
-                newJobs.push({
-                    text: cleanText,
-                    voice: getVoiceForChar(info.charName, seg.type),
-                    parentJob: parentJob
-                });
+                newJobs.push({ text: cleanText, voice: getVoiceForChar(info.charName, seg.type), parentJob: parentJob });
             }
         });
     });
     
-    if (newJobs.length === 0) {
-        playerStatus(info.playerEl, 'no-audio', 'Text empty after filters');
-        return;
-    }
+    if (newJobs.length === 0) { playerStatus(info.playerEl, 'no-audio', 'Text empty after filters'); return; }
     
     activeEagerJobs.set(info.akBase, parentJob);
-    
     apiFetch(`${API}/queue/pause`, { method: 'POST', signal: globalAbortController.signal }).catch(()=>{});
 
     if (eagerAbortController) {
@@ -576,7 +397,6 @@ async function startEagerStreaming(info) {
     }
 
     eagerTtsQueue.unshift(...newJobs);
-    
     const playBtn = info.playerEl.querySelector('.ttp-play');
     if (playBtn) playBtn.removeAttribute('disabled');
 
@@ -599,8 +419,7 @@ function playNextEagerChunk(job) {
             job.playIndex++;
             if (job.playIndex < job.totalChunks) {
                 const silenceSec = parseFloat(getSettings().chunkSilenceSeconds) || 0;
-                const fmt = getSettings().ttsFormat;
-                if (silenceSec > 0 && (fmt === 'wav' || fmt === 'pcm')) {
+                if (silenceSec > 0) {
                     job.silenceTimeoutId = setTimeout(() => {
                         job.silenceTimeoutId = null;
                         playNextEagerChunk(job);
@@ -610,16 +429,12 @@ function playNextEagerChunk(job) {
                 }
             } else {
                 job.isPlaying = false;
-                if (job.pendingChunks === 0) {
-                    activeEagerJobs.delete(job.akBase);
-                }
+                if (job.pendingChunks === 0) activeEagerJobs.delete(job.akBase);
                 if (eagerAudioElement._linkedPlayBtn) eagerAudioElement._linkedPlayBtn.textContent = '▶';
                 
                 if (job.playerEl) {
                     const audio = job.playerEl.querySelector('audio');
-                    if (audio && audio.readyState >= 1) {
-                        audio.currentTime = audio.duration;
-                    }
+                    if (audio && audio.readyState >= 1) audio.currentTime = audio.duration;
                 }
             }
         };
@@ -637,7 +452,6 @@ function playNextEagerChunk(job) {
 
 async function processEagerTtsQueue() {
     if (isEagerProcessing) return;
-    
     if (eagerTtsQueue.length === 0) {
         apiFetch(`${API}/queue/resume`, { method: 'POST', signal: globalAbortController.signal }).catch(()=>{});
         return;
@@ -662,6 +476,8 @@ async function processEagerTtsQueue() {
         const body = {
             ttsUrl: c.ttsEndpoint,
             ttsApiKey: c.ttsApiKey.trim() || 'sk-none',
+            eagerJobId: parent.akBase,                     // Tell Server to stash it
+            chunkIndex: parent.collectedBlobs.length,      // Send correct order index
             ttsBody: {
                 model: c.ttsModel,
                 input: currentEagerChunkJob.text,
@@ -697,31 +513,23 @@ async function processEagerTtsQueue() {
         }
 
         parent.pendingChunks--;
-
-        if (parent.pendingChunks === 0) {
-            await finalizeAndSaveAudio(parent);
-        }
+        if (parent.pendingChunks === 0) await finalizeAndSaveAudio(parent);
     } catch (e) {
         if (e.name === 'AbortError') {
-            if (isNukingEager) {
-                console.log("[TTS Persist] 🛑 Eager Task Destroyed.");
-            } else {
+            if (isNukingEager) console.log("[TTS Persist] 🛑 Eager Task Destroyed.");
+            else {
                 console.log("[TTS Persist] ⏸ Eager Task Aborted & Re-queued.");
                 eagerTtsQueue.unshift(currentEagerChunkJob); 
             }
         } else {
             console.error("[TTS Persist] Eager Fetch Failed:", e);
-            if (parent.playerEl && document.contains(parent.playerEl)) {
-                playerStatus(parent.playerEl, 'error', e.message);
-            }
+            if (parent.playerEl && document.contains(parent.playerEl)) playerStatus(parent.playerEl, 'error', e.message);
         }
     } finally {
         eagerAbortController = null;
         currentEagerChunkJob = null;
         isEagerProcessing = false;
-        
         if (eagerTtsQueue.length === 0) isNukingEager = false; 
-        
         processEagerTtsQueue();
     }
 }
@@ -730,72 +538,8 @@ async function finalizeAndSaveAudio(parentJob) {
     try {
         if (!parentJob.collectedBlobs.length) return;
         
-        const ttsFmt = getSettings().ttsFormat;
-        const actualFormat = await detectFormatClient(parentJob.collectedBlobs[0], ttsFmt);
-        const silenceSeconds = parseFloat(getSettings().chunkSilenceSeconds) || 0;
-        
-        let finalBlob;
-        
-        if (actualFormat === 'wav') {
-            let totalLen = 0;
-            const buffers = [];
-            let sampleRate = 24000; 
-            
-            for (let i = 0; i < parentJob.collectedBlobs.length; i++) {
-                const b = parentJob.collectedBlobs[i];
-                const arr = await b.arrayBuffer();
-                const { pcm, sampleRate: sr } = extractPcmFromWavArrayBuffer(arr);
-                if (i === 0) sampleRate = sr;
-                
-                buffers.push(pcm);
-                totalLen += pcm.length;
-
-                if (silenceSeconds > 0 && i < parentJob.collectedBlobs.length - 1) {
-                    const silenceBytes = Math.floor(sampleRate * 2 * silenceSeconds);
-                    const silenceArr = new Uint8Array(silenceBytes);
-                    buffers.push(silenceArr);
-                    totalLen += silenceBytes;
-                }
-            }
-            
-            const merged = new Uint8Array(totalLen);
-            let offset = 0;
-            for (const arr of buffers) {
-                merged.set(arr, offset);
-                offset += arr.length;
-            }
-            finalBlob = await createWavBlob(new Blob([merged]), { sampleRate: sampleRate, bitDepth: 16, numChannels: 1 });
-            
-        } else if (actualFormat === 'mp3') {
-            let totalLen = 0;
-            const buffers = [];
-            
-            for (let i = 0; i < parentJob.collectedBlobs.length; i++) {
-                const b = parentJob.collectedBlobs[i];
-                const arr = await b.arrayBuffer();
-                const clean = cleanMp3Data(new Uint8Array(arr));
-                buffers.push(clean);
-                totalLen += clean.length;
-            }
-            
-            const merged = new Uint8Array(totalLen);
-            let offset = 0;
-            for (const arr of buffers) {
-                merged.set(arr, offset);
-                offset += arr.length;
-            }
-            finalBlob = new Blob([merged], { type: 'audio/mpeg' });
-            
-        } else {
-            finalBlob = new Blob(parentJob.collectedBlobs, { type: parentJob.collectedBlobs[0].type });
-        }
-
-        const base64Data = await new Promise((resolve) => {
-            const reader = new FileReader();
-            reader.onloadend = () => resolve(reader.result.split(',')[1]);
-            reader.readAsDataURL(finalBlob);
-        });
-        
+        // Massive Bandwidth Save: No more Base64 uploading.
+        // We just tell the Server to run FFmpeg on the chunks it already stashed.
         const saveRes = await apiFetch(`${API}/save`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -804,8 +548,8 @@ async function finalizeAndSaveAudio(parentJob) {
                 textHash: parentJob.hash,
                 charName: parentJob.charName,
                 chatId: parentJob.chatId,
-                audioData: base64Data,
-                format: actualFormat === 'wav' ? 'wav' : ttsFmt
+                format: getSettings().ttsFormat,
+                chunkSilenceSeconds: getSettings().chunkSilenceSeconds
             }),
             signal: globalAbortController.signal 
         });
@@ -816,15 +560,11 @@ async function finalizeAndSaveAudio(parentJob) {
             loadAudio(parentJob.playerEl, buildAudioUrl(parentJob.charName, parentJob.chatId, parentJob.akBase), parentJob.hash);
         }
         
-        if (!parentJob.isPlaying) {
-            activeEagerJobs.delete(parentJob.akBase);
-        }
+        if (!parentJob.isPlaying) activeEagerJobs.delete(parentJob.akBase);
     } catch (e) {
         if (e.name === 'AbortError') return;
         console.error("[TTS Persist] Finalize Error:", e);
-        if (parentJob.playerEl && document.contains(parentJob.playerEl)) {
-            playerStatus(parentJob.playerEl, 'error', 'Merge/Save failed');
-        }
+        if (parentJob.playerEl && document.contains(parentJob.playerEl)) playerStatus(parentJob.playerEl, 'error', 'Merge/Save failed');
         activeEagerJobs.delete(parentJob.akBase);
     }
 }
@@ -837,22 +577,12 @@ function clearAllQueuesSyncAndFire() {
     eagerAudioElement.pause();
     eagerAudioElement.src = '';
     
-    if (eagerAbortController) {
-        eagerAbortController.abort();
-        eagerAbortController = null;
-    }
-
-    if (globalAbortController) {
-        globalAbortController.abort(); 
-        globalAbortController = new AbortController(); 
-    }
+    if (eagerAbortController) { eagerAbortController.abort(); eagerAbortController = null; }
+    if (globalAbortController) { globalAbortController.abort(); globalAbortController = new AbortController(); }
     
     activeEagerJobs.forEach(job => {
         job.isPlaying = false;
-        if (job.silenceTimeoutId) {
-            clearTimeout(job.silenceTimeoutId);
-            job.silenceTimeoutId = null;
-        }
+        if (job.silenceTimeoutId) { clearTimeout(job.silenceTimeoutId); job.silenceTimeoutId = null; }
         if (job.playerEl) {
             const playBtn = job.playerEl.querySelector('.ttp-play');
             if (playBtn) playBtn.textContent = '▶';
@@ -861,7 +591,6 @@ function clearAllQueuesSyncAndFire() {
     activeEagerJobs.clear();
 
     apiFetch(`${API}/queue/clear`, { method: 'POST', signal: globalAbortController.signal }).catch(()=>{});
-    
     pendingServerJobs.clear();
     
     document.querySelectorAll('.ttp-dot[data-state="generating"], .ttp-dot[data-state="queued"]').forEach(dot => {
@@ -872,9 +601,7 @@ function clearAllQueuesSyncAndFire() {
     });
 }
 
-function clearAllQueues() {
-    clearAllQueuesSyncAndFire();
-}
+function clearAllQueues() { clearAllQueuesSyncAndFire(); }
 
 function batchQueueMissing() {
     const narrateUser = getSettings().narrateUserMessages;
@@ -885,7 +612,6 @@ function batchQueueMissing() {
 
         mesEl.querySelectorAll('.ttp-wrap').forEach(wrap => {
             if (wrap.style.display === 'none') return;
-            
             const state = wrap.querySelector('.ttp-dot')?.dataset?.state;
             if (state === 'no-audio' || state === 'error' || state === 'stale') {
                 const infoStr = wrap.dataset.fullInfo;
@@ -901,7 +627,6 @@ function batchQueueMissing() {
 
 function batchRegenAll() {
     if (!confirm('Are you sure you want to regenerate all audio for this chat?')) return;
-    
     const narrateUser = getSettings().narrateUserMessages;
     document.querySelectorAll('.mes').forEach(mesEl => {
         const info = getMsgInfo(mesEl);
@@ -910,7 +635,6 @@ function batchRegenAll() {
 
         mesEl.querySelectorAll('.ttp-wrap').forEach(async wrap => {
             if (wrap.style.display === 'none') return;
-            
             const infoStr = wrap.dataset.fullInfo;
             if (infoStr) {
                 const wrapInfo = JSON.parse(infoStr);
@@ -930,7 +654,6 @@ function batchRegenAll() {
                     activeEagerJobs.delete(wrapInfo.akBase);
                 }
                 pendingServerJobs.delete(wrapInfo.akBase);
-
                 requestGeneration(wrapInfo, false); 
             }
         });
@@ -939,12 +662,9 @@ function batchRegenAll() {
 
 async function clearChatAudio() {
     if (!confirm('Delete all stored audio for the current chat? (This includes User messages and all Persona/Group members)')) return;
-    
     const c = ctx();
     const chatId = c.chatId || 'unknown';
-    
     await apiFetch(`${API}/chat-all/${encodeURIComponent(chatId)}`, { method: 'DELETE' }).catch(console.error);
-    
     document.querySelectorAll('.ttp-wrap').forEach(clearAudio);
     keyCache.clear();
 }
@@ -964,7 +684,6 @@ function playerStatus(el, state, customTip) {
     if (!el) return;
     const dot = el.querySelector('.ttp-dot');
     if (!dot) return;
-    
     const s = STATES[state] || STATES['no-audio'];
     dot.textContent = s.icon;
     dot.title = customTip || s.tip;
@@ -972,19 +691,15 @@ function playerStatus(el, state, customTip) {
     dot.classList.toggle('ttp-spin', state === 'generating');
 }
 
-function buildAudioUrl(charName, chatId, ak) {
-    return `${API}/audio/${encodeURIComponent(charName)}/${encodeURIComponent(chatId)}/${encodeURIComponent(ak)}`;
-}
+function buildAudioUrl(charName, chatId, ak) { return `${API}/audio/${encodeURIComponent(charName)}/${encodeURIComponent(chatId)}/${encodeURIComponent(ak)}`; }
 
 function loadAudio(el, url, hash) {
     if (!el) return;
     const audio = el.querySelector('audio');
     if (!audio) return;
-    
     audio.src = url + '?t=' + Date.now();
     audio.playbackRate = getSettings().audioPlaybackSpeed || 1.0;
     audio.load();
-    
     el.dataset.loadedHash = hash || '';
     el.querySelector('.ttp-play')?.removeAttribute('disabled');
     playerStatus(el, 'ready');
@@ -993,11 +708,7 @@ function loadAudio(el, url, hash) {
 function clearAudio(el) {
     if (!el) return;
     const audio = el.querySelector('audio');
-    if (audio) { 
-        audio.pause(); 
-        audio.src = ''; 
-        audio.load(); 
-    }
+    if (audio) { audio.pause(); audio.src = ''; audio.load(); }
     el.dataset.loadedHash = '';
     const playBtn = el.querySelector('.ttp-play');
     if (playBtn) playBtn.setAttribute('disabled', '');
@@ -1014,12 +725,9 @@ function fmtTime(s) {
 function makePlayer() {
     const wrap = document.createElement('div');
     wrap.className = 'ttp-wrap';
-    
     const c = getSettings();
     const isMobile = window.innerWidth <= 768;
-    if (isMobile ? c.collapseOnMobile : c.collapseOnPc) {
-        wrap.classList.add('ttp-collapsed');
-    }
+    if (isMobile ? c.collapseOnMobile : c.collapseOnPc) wrap.classList.add('ttp-collapsed');
 
     wrap.innerHTML = `
         <audio preload="none"></audio>
@@ -1050,18 +758,13 @@ function makePlayer() {
         if (activeJob) {
             if (activeJob.isPlaying) {
                 activeJob.isPlaying = false;
-                if (activeJob.silenceTimeoutId) {
-                    clearTimeout(activeJob.silenceTimeoutId);
-                    activeJob.silenceTimeoutId = null;
-                }
+                if (activeJob.silenceTimeoutId) { clearTimeout(activeJob.silenceTimeoutId); activeJob.silenceTimeoutId = null; }
                 eagerAudioElement.pause();
                 playBtn.textContent = '▶';
-
                 if (activeJob.pendingChunks === 0) {
                     activeEagerJobs.delete(akBase);
-                    if (audio.readyState >= 1 && audio.duration) {
-                        audio.currentTime = (activeJob.playIndex / activeJob.totalChunks) * audio.duration;
-                    } else {
+                    if (audio.readyState >= 1 && audio.duration) audio.currentTime = (activeJob.playIndex / activeJob.totalChunks) * audio.duration;
+                    else {
                         audio.addEventListener('loadedmetadata', function onMeta() {
                             audio.currentTime = (activeJob.playIndex / activeJob.totalChunks) * audio.duration;
                             audio.removeEventListener('loadedmetadata', onMeta);
@@ -1070,22 +773,17 @@ function makePlayer() {
                 }
                 return;
             } else {
-                if (activeJob.pendingChunks === 0) {
-                    activeEagerJobs.delete(akBase);
-                } else {
+                if (activeJob.pendingChunks === 0) activeEagerJobs.delete(akBase);
+                else {
                     activeEagerJobs.forEach(job => {
                         if (job !== activeJob && job.isPlaying) {
                             job.isPlaying = false;
-                            if (job.silenceTimeoutId) {
-                                clearTimeout(job.silenceTimeoutId);
-                                job.silenceTimeoutId = null;
-                            }
+                            if (job.silenceTimeoutId) { clearTimeout(job.silenceTimeoutId); job.silenceTimeoutId = null; }
                             const otherBtn = job.playerEl.querySelector('.ttp-play');
                             if (otherBtn) otherBtn.textContent = '▶';
                         }
                     });
                     document.querySelectorAll('.ttp-wrap audio').forEach(a => { if (!a.paused) a.pause(); });
-
                     activeJob.isPlaying = true;
                     playNextEagerChunk(activeJob);
                     return;
@@ -1099,24 +797,15 @@ function makePlayer() {
             activeEagerJobs.forEach(job => {
                 if (job.isPlaying) {
                     job.isPlaying = false;
-                    if (job.silenceTimeoutId) {
-                        clearTimeout(job.silenceTimeoutId);
-                        job.silenceTimeoutId = null;
-                    }
+                    if (job.silenceTimeoutId) { clearTimeout(job.silenceTimeoutId); job.silenceTimeoutId = null; }
                     const otherBtn = job.playerEl.querySelector('.ttp-play');
                     if (otherBtn) otherBtn.textContent = '▶';
                 }
             });
             eagerAudioElement.pause();
-            
-            document.querySelectorAll('.ttp-wrap audio').forEach(a => {
-                if (a !== audio && !a.paused) a.pause();
-            });
-            
+            document.querySelectorAll('.ttp-wrap audio').forEach(a => { if (a !== audio && !a.paused) a.pause(); });
             audio.play();
-        } else {
-            audio.pause();
-        }
+        } else audio.pause();
     });
 
     audio.addEventListener('play', () => { playBtn.textContent = '⏸'; });
@@ -1148,14 +837,9 @@ function makePlayer() {
                 if (eagerAudioElement._linkedPlayBtn === playBtn) eagerAudioElement.pause();
                 activeEagerJobs.delete(akBase);
                 playBtn.textContent = '▶';
-            } else {
-                return;
-            }
+            } else return;
         }
-
-        if (audio.duration) {
-            audio.currentTime = (seekEl.value / 1000) * audio.duration;
-        }
+        if (audio.duration) audio.currentTime = (seekEl.value / 1000) * audio.duration;
     });
 
     wrap.querySelector('.ttp-reload').addEventListener('click', () => {
@@ -1165,11 +849,9 @@ function makePlayer() {
 
     wrap.querySelector('.ttp-del').addEventListener('click', async () => {
         if (!confirm('Delete the audio file for this specific message?')) return;
-        
         const akBase = wrap.dataset.currentAk;
         const infoStr = wrap.dataset.fullInfo;
         if (!infoStr) return;
-        
         const info = JSON.parse(infoStr);
 
         const activeJob = activeEagerJobs.get(akBase);
@@ -1182,7 +864,6 @@ function makePlayer() {
         pendingServerJobs.delete(akBase);
 
         await apiFetch(buildAudioUrl(info.charName, info.chatId, akBase), { method: 'DELETE', signal: globalAbortController.signal }).catch(()=>{});
-        
         clearAudio(wrap);
     });
 
@@ -1201,7 +882,6 @@ function wireGenButton(wrap, info) {
 
     newBtn.addEventListener('click', async () => {
         if (!getSettings().enabled) return;
-
         const activeJob = activeEagerJobs.get(info.akBase);
         if (activeJob) {
             activeJob.isPlaying = false;
@@ -1216,7 +896,6 @@ function wireGenButton(wrap, info) {
             await apiFetch(buildAudioUrl(info.charName, info.chatId, info.akBase), { method: 'DELETE', signal: globalAbortController.signal }).catch(()=>{});
             clearAudio(wrap);
         }
-        
         requestGeneration(info, true); 
     });
 }
@@ -1226,17 +905,12 @@ function ensureContainer(mesEl) {
     if (!container) {
         container = document.createElement('div');
         container.className = 'ttp-container';
-        
         container.style.marginRight = '85px'; 
         container.style.marginTop = '10px';
         container.style.clear = 'both';
-        
         const mesText = mesEl.querySelector('.mes_text');
-        if (mesText) {
-            mesText.insertAdjacentElement('afterend', container);
-        } else {
-            mesEl.appendChild(container);
-        }
+        if (mesText) mesText.insertAdjacentElement('afterend', container);
+        else mesEl.appendChild(container);
     }
     return container;
 }
@@ -1248,18 +922,13 @@ let currentKnownChars = [];
 async function inject(mesEl, forceRefresh = false) {
     const info = getMsgInfo(mesEl);
     if (!info) return;
-
     if (info.isUser && !getSettings().narrateUserMessages) return;
 
     const currentActiveChat = ctx().chatId;
-    if (info.chatId !== currentActiveChat && currentActiveChat !== undefined) {
-        return; 
-    }
+    if (info.chatId !== currentActiveChat && currentActiveChat !== undefined) return; 
 
     if (getSettings().abortOnChatChange && queueServingChatId !== info.chatId) {
-        if (queueServingChatId !== null) {
-            clearAllQueuesSyncAndFire();
-        }
+        if (queueServingChatId !== null) clearAllQueuesSyncAndFire();
         queueServingChatId = info.chatId;
     } else if (!queueServingChatId) {
         queueServingChatId = info.chatId;
@@ -1271,39 +940,30 @@ async function inject(mesEl, forceRefresh = false) {
     }
 
     const item = { ...info, hash: textHash(info.rawText) };
-
     cacheSet(info.mesid, { dateKey: info.dk, charName: info.charName, chatId: info.chatId });
     await renderSinglePlayer(mesEl, item, forceRefresh);
 }
 
 async function renderSinglePlayer(mesEl, item, forceRefresh) {
     const container = ensureContainer(mesEl);
-    
     const allWraps = container.querySelectorAll('.ttp-wrap');
     let wrap = null;
     
     allWraps.forEach(w => {
         if (w.dataset.currentAk !== item.akBase) {
             w.style.display = 'none'; 
-            
             const audio = w.querySelector('audio');
-            if (audio && !audio.paused) {
-                audio.pause();
-            }
+            if (audio && !audio.paused) audio.pause();
             
             const activeJob = activeEagerJobs.get(w.dataset.currentAk);
             if (activeJob && activeJob.isPlaying) {
                 activeJob.isPlaying = false;
                 if (activeJob.silenceTimeoutId) clearTimeout(activeJob.silenceTimeoutId);
-                if (eagerAudioElement._linkedPlayBtn === w.querySelector('.ttp-play')) {
-                    eagerAudioElement.pause();
-                }
+                if (eagerAudioElement._linkedPlayBtn === w.querySelector('.ttp-play')) eagerAudioElement.pause();
                 const playBtn = w.querySelector('.ttp-play');
                 if (playBtn) playBtn.textContent = '▶';
             }
-        } else {
-            wrap = w; 
-        }
+        } else wrap = w; 
     });
 
     let isHashChanged = false;
@@ -1312,22 +972,14 @@ async function renderSinglePlayer(mesEl, item, forceRefresh) {
         if (oldInfoStr) {
             try {
                 const oldInfo = JSON.parse(oldInfoStr);
-                if (oldInfo.hash && oldInfo.hash !== item.hash) {
-                    isHashChanged = true;
-                }
+                if (oldInfo.hash && oldInfo.hash !== item.hash) isHashChanged = true;
             } catch(e){}
         }
     }
 
     if (wrap) {
-        if (!forceRefresh && !isHashChanged) {
-            wrap.style.display = 'flex'; 
-            return;
-        }
-        
-        clearAudio(wrap);
-        wrap.remove();
-        wrap = null;
+        if (!forceRefresh && !isHashChanged) { wrap.style.display = 'flex'; return; }
+        clearAudio(wrap); wrap.remove(); wrap = null;
     }
 
     wrap = makePlayer();
@@ -1367,9 +1019,7 @@ async function loadOrQueue(wrap, item) {
         const data = await r.json();
         exists = data.exists;
         textHash = data.textHash;
-    } catch (e) { 
-        if (e.name === 'AbortError') return; 
-    }
+    } catch (e) { if (e.name === 'AbortError') return; }
 
     if (exists) {
         if (textHash && textHash !== hash) {
@@ -1393,12 +1043,8 @@ async function loadOrQueue(wrap, item) {
         const totalMsgs = context.chat?.length ?? 0;
         const mesid = Number(wrap.closest('.mes')?.getAttribute('mesid') ?? -1);
         const cSettings = getSettings();
-        
         const shouldAuto = cSettings.enabled && cSettings.autoBackground && (mesid < (totalMsgs - cSettings.batchSkipLast));
-
-        if (shouldAuto) {
-            requestGeneration(item, false); 
-        }
+        if (shouldAuto) requestGeneration(item, false); 
     }
 }
 
@@ -1423,10 +1069,7 @@ function advanceSlidingWindow(latestMesId) {
         const targetInfo = JSON.parse(activeWrap.dataset.fullInfo);
         targetInfo.playerEl = activeWrap;
         const state = activeWrap.querySelector('.ttp-dot')?.dataset?.state;
-        
-        if (state === 'no-audio') {
-            requestGeneration(targetInfo, false);
-        }
+        if (state === 'no-audio') requestGeneration(targetInfo, false);
     }
 }
 
@@ -1438,26 +1081,20 @@ function hookEvents() {
     ev.on(et.CHARACTER_MESSAGE_RENDERED, (mesId) => {
         const el = document.querySelector(`.mes[mesid="${mesId}"]`);
         if (el) inject(el, true);
-        
         advanceSlidingWindow(mesId);
     });
 
     if (et.USER_MESSAGE_RENDERED) {
         ev.on(et.USER_MESSAGE_RENDERED, (mesId) => {
             advanceSlidingWindow(mesId);
-            
             if (!getSettings().narrateUserMessages) return;
             const el = document.querySelector(`.mes[mesid="${mesId}"]`);
             if (el) inject(el, true);
         });
     }
 
-    if (et.MESSAGE_UPDATED) {
-        ev.on(et.MESSAGE_UPDATED, (mesId) => inject(document.querySelector(`.mes[mesid="${mesId}"]`), false));
-    }
-    if (et.MESSAGE_SWIPED) {
-        ev.on(et.MESSAGE_SWIPED,  (mesId) => inject(document.querySelector(`.mes[mesid="${mesId}"]`), false));
-    }
+    if (et.MESSAGE_UPDATED) ev.on(et.MESSAGE_UPDATED, (mesId) => inject(document.querySelector(`.mes[mesid="${mesId}"]`), false));
+    if (et.MESSAGE_SWIPED) ev.on(et.MESSAGE_SWIPED,  (mesId) => inject(document.querySelector(`.mes[mesid="${mesId}"]`), false));
 
     if (et.MESSAGE_DELETED) {
         ev.on(et.MESSAGE_DELETED, (mesId) => {
@@ -1473,10 +1110,7 @@ function hookEvents() {
     if (et.CHAT_CHANGED) {
         ev.on(et.CHAT_CHANGED, () => {            
             keyCache.clear();
-            setTimeout(() => {
-                injectAll();
-                refreshCharacterVoicesUI();
-            }, 400);
+            setTimeout(() => { injectAll(); refreshCharacterVoicesUI(); }, 400);
         });
     }
 }
@@ -1528,9 +1162,7 @@ function getKnownCharacters() {
 
     if (Array.isArray(context.chat)) {
         context.chat.forEach(msg => {
-            if (msg.name && msg.name !== 'unknown') {
-                names.add(msg.name.trim());
-            }
+            if (msg.name && msg.name !== 'unknown') names.add(msg.name.trim());
         });
     }
 
@@ -1594,11 +1226,8 @@ function buildCharacterVoicesSection(container, charactersToRender = null) {
         sel.addEventListener('change', () => {
             const s = getSettings();
             if (!s.characterVoices) s.characterVoices = {};
-            if (sel.value) {
-                s.characterVoices[charName] = sel.value;
-            } else {
-                delete s.characterVoices[charName];
-            }
+            if (sel.value) s.characterVoices[charName] = sel.value;
+            else delete s.characterVoices[charName];
             saveSettings();
         });
 
@@ -1631,9 +1260,7 @@ async function previewVoice(voiceName) {
             }
         };
         
-        if (c.ttsInstructions?.trim()) {
-            body.ttsBody.instructions = c.ttsInstructions.trim();
-        }
+        if (c.ttsInstructions?.trim()) body.ttsBody.instructions = c.ttsInstructions.trim();
 
         const res = await apiFetch(`${API}/generate-eager`, {
             method:  'POST',
@@ -1646,10 +1273,13 @@ async function previewVoice(voiceName) {
         const blob = await res.blob();
         let finalBlob = blob;
         
-        if (c.ttsFormat === 'pcm' || c.ttsFormat === 'wav') {
-            const arr = await blob.arrayBuffer();
-            const { pcm, sampleRate } = extractPcmFromWavArrayBuffer(arr);
-            finalBlob = await createWavBlob(new Blob([pcm]), { sampleRate, bitDepth: 16, numChannels: 1 });
+        const arr = await blob.arrayBuffer();
+        const head = new Uint8Array(arr, 0, 4);
+        const isWav = head[0]===0x52 && head[1]===0x49 && head[2]===0x46 && head[3]===0x46;
+
+        if (isWav) {
+            const { pcm, sampleRate, numChannels, bitDepth, audioFormat } = extractPcmFromWavArrayBuffer(arr);
+            finalBlob = await createWavBlob(new Blob([pcm]), { sampleRate: sampleRate || 24000, bitDepth: bitDepth || 16, numChannels: numChannels || 1, audioFormat: audioFormat || 1 });
         }
 
         previewAudio = new Audio(URL.createObjectURL(finalBlob));
@@ -1735,7 +1365,7 @@ function buildSettings() {
         <div class="ttp-row ttp-row-inline" style="margin-left: 20px;">
             <label>Silence Between Chunks</label>
             <input class="ttp-input ttp-input-sm" type="number" id="ttp-chunk-silence" value="${c.chunkSilenceSeconds}" min="0" max="10" step="0.5">
-            <span class="ttp-hint">seconds (WAV/PCM format only)</span>
+            <span class="ttp-hint">seconds</span>
         </div>
 
         <div class="ttp-divider"></div>
@@ -1886,20 +1516,16 @@ function buildSettings() {
     function syncCfg() {
         try {
             const s = getSettings();
-            
             s.enabled = $('ttp-enabled').checked;
             s.narrateUserMessages = $('ttp-narrate-user').checked;
             s.autoBackground = $('ttp-auto').checked;
             s.abortOnChatChange = $('ttp-abort-chat-change').checked;
             s.collapseOnMobile = $('ttp-collapse-mobile').checked;
             s.collapseOnPc = $('ttp-collapse-pc').checked;
-            
             s.streamManualPlayback = $('ttp-stream-manual').checked;
             s.chunkBackgroundRequests = $('ttp-chunk-background').checked;
-
             s.chunkMinLength = parseInt($('ttp-chunk-min-length').value, 10) || 0;
             s.chunkSilenceSeconds = parseFloat($('ttp-chunk-silence').value) || 0;
-
             s.onlyNarrateQuotes = $('ttp-only-quotes').checked;
             s.ignoreAsterisksText = $('ttp-ignore-asterisks').checked;
             s.narrateOnlyTranslated = $('ttp-only-translated').checked;
@@ -1909,18 +1535,14 @@ function buildSettings() {
             s.differentVoicesForSegments = $('ttp-diff-voices').checked;
             s.applyRegexFilter = $('ttp-regex-filter').checked;
             s.regexPattern = $('ttp-regex-pattern').value;
-            
             s.batchSkipLast = parseInt($('ttp-skip').value, 10);
             if (isNaN(s.batchSkipLast)) s.batchSkipLast = 0;
-
             s.deleteOnEdit = $('ttp-delonedit').checked;
             s.keepSwipeAudio = $('ttp-keepswipe').checked;
-            
             s.ttsVoice = $('ttp-voice-global').value;
             s.ttsVoiceNarration = $('ttp-voice-narration').value;
             s.ttsVoiceQuotes = $('ttp-voice-quotes').value;
             s.ttsVoiceAsterisks = $('ttp-voice-asterisks').value;
-            
             s.ttsEndpoint = $('ttp-endpoint').value;
             s.ttsApiKey = $('ttp-apikey').value;
             s.ttsModel = $('ttp-model').value;
@@ -1930,11 +1552,8 @@ function buildSettings() {
             s.ttsInstructions = $('ttp-instructions').value;
             
             const extraVal = $('ttp-extra').value.trim();
-            if (!extraVal) {
-                s.extraParams = '{}';
-            } else {
-                try { JSON.parse(extraVal); s.extraParams = extraVal; } catch {}
-            }
+            if (!extraVal) s.extraParams = '{}';
+            else { try { JSON.parse(extraVal); s.extraParams = extraVal; } catch {} }
 
             const regexBlock = section.querySelector('.ttp-regex-block');
             if (regexBlock) regexBlock.classList.toggle('ttp-hidden', !s.applyRegexFilter);
@@ -1943,9 +1562,7 @@ function buildSettings() {
             if (segDiv) segDiv.classList.toggle('ttp-hidden', !s.differentVoicesForSegments);
             
             saveSettings();
-        } catch (err) {
-            console.error('[TTS Persist] Error syncing config:', err);
-        }
+        } catch (err) { console.error('[TTS Persist] Error syncing config:', err); }
     }
 
     let voiceTimer;
@@ -1960,25 +1577,16 @@ function buildSettings() {
         }, 500);
     });
 
-    $('ttp-speed').addEventListener('input', () => { 
-        $('ttp-speed-val').textContent = parseFloat($('ttp-speed').value).toFixed(2); 
-        syncCfg(); 
-    });
-
+    $('ttp-speed').addEventListener('input', () => { $('ttp-speed-val').textContent = parseFloat($('ttp-speed').value).toFixed(2); syncCfg(); });
     $('ttp-playback-speed').addEventListener('input', () => {
         $('ttp-playback-speed-val').textContent = parseFloat($('ttp-playback-speed').value).toFixed(2);
-        document.querySelectorAll('.ttp-wrap audio').forEach(a => {
-            a.playbackRate = parseFloat($('ttp-playback-speed').value) || 1.0;
-        });
+        document.querySelectorAll('.ttp-wrap audio').forEach(a => { a.playbackRate = parseFloat($('ttp-playback-speed').value) || 1.0; });
         syncCfg();
     });
 
     section.addEventListener('input', (e) => {
-        if (e.target.id === 'ttp-avail-voices') return; 
-        if (e.target.id === 'ttp-speed' || e.target.id === 'ttp-playback-speed') return; 
-        if (['INPUT', 'SELECT', 'TEXTAREA'].includes(e.target.tagName)) {
-            syncCfg();
-        }
+        if (e.target.id === 'ttp-avail-voices' || e.target.id === 'ttp-speed' || e.target.id === 'ttp-playback-speed') return; 
+        if (['INPUT', 'SELECT', 'TEXTAREA'].includes(e.target.tagName)) syncCfg();
     });
 
     charVoicesContainer = $('ttp-char-voices-list');
@@ -1998,28 +1606,19 @@ function buildSettings() {
         $('ttp-toggle-debug').textContent = hidden ? 'Log ▼' : 'Log ▲';
     });
 
-    // ── TEST CONNECTION BUTTON LOGIC ──
     $('ttp-test-connection').addEventListener('click', async () => {
         const btn = $('ttp-test-connection');
         const resEl = $('ttp-test-result');
-        
         syncCfg(); 
         const c = getSettings();
         
-        if (!c.ttsEndpoint) {
-            resEl.textContent = '❌ Error: Endpoint is empty';
-            resEl.style.color = '#eb5757';
-            return;
-        }
+        if (!c.ttsEndpoint) { resEl.textContent = '❌ Error: Endpoint is empty'; resEl.style.color = '#eb5757'; return; }
 
-        btn.disabled = true;
-        btn.style.opacity = '0.5';
-        resEl.textContent = 'Testing connection...';
-        resEl.style.color = '#f2c94c';
+        btn.disabled = true; btn.style.opacity = '0.5';
+        resEl.textContent = 'Testing connection...'; resEl.style.color = '#f2c94c';
 
         try {
             let extra = {}; try { extra = JSON.parse(c.extraParams || '{}'); } catch {}
-            
             const body = {
                 ttsUrl: c.ttsEndpoint,
                 ttsApiKey: c.ttsApiKey.trim() || 'sk-none',
@@ -2032,33 +1631,16 @@ function buildSettings() {
                     ...extra
                 }
             };
-
-            const res = await apiFetch(`${API}/generate-eager`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(body)
-            });
-
-            if (!res.ok) {
-                const errText = await res.text();
-                throw new Error(`HTTP ${res.status}: ${errText}`);
-            }
-            
+            const res = await apiFetch(`${API}/generate-eager`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+            if (!res.ok) throw new Error(`HTTP ${res.status}: ${await res.text()}`);
             const blob = await res.blob();
-            if (blob.size > 0) {
-                resEl.textContent = '✅ Connected successfully!';
-                resEl.style.color = '#6fcf97';
-            } else {
-                throw new Error('API returned an empty file.');
-            }
-
+            if (blob.size > 0) { resEl.textContent = '✅ Connected successfully!'; resEl.style.color = '#6fcf97'; } 
+            else throw new Error('API returned an empty file.');
         } catch (err) {
             console.error('[TTS Persist] Test Connection Error:', err);
-            resEl.textContent = `❌ ${err.message}`;
-            resEl.style.color = '#eb5757';
+            resEl.textContent = `❌ ${err.message}`; resEl.style.color = '#eb5757';
         } finally {
-            btn.disabled = false;
-            btn.style.opacity = '1';
+            btn.disabled = false; btn.style.opacity = '1';
         }
     });
 
@@ -2069,52 +1651,34 @@ function buildSettings() {
 }
 
 function init() {
-    buildSettings();
-    hookEvents();
-    observeChat();
-    injectAll();
+    buildSettings(); hookEvents(); observeChat(); injectAll();
     
-    // Polling Loop: Checks UI state and polls Server for background jobs
     setInterval(async () => {
         const qInfo = document.getElementById('ttp-queue-info');
         const debugBox = document.getElementById('ttp-queue-debug');
         let qRes = { active: null, pending: [] };
-        
-        try {
-            qRes = await apiFetch(`${API}/queue/status`).then(r=>r.json());
-        } catch(e) {}
+        try { qRes = await apiFetch(`${API}/queue/status`).then(r=>r.json()); } catch(e) {}
 
         const frontEndQ = eagerTtsQueue.length;
         if (qInfo) {
-            if (qRes.active || qRes.pending.length > 0 || frontEndQ > 0 || isEagerProcessing) {
-                qInfo.textContent = `Queue: ${qRes.active || isEagerProcessing ? '⟳ working' : 'waiting'} · Server: ${qRes.pending.length} · Eager: ${frontEndQ}`;
-            } else {
-                qInfo.textContent = 'Queue: idle';
-            }
+            if (qRes.active || qRes.pending.length > 0 || frontEndQ > 0 || isEagerProcessing) qInfo.textContent = `Queue: ${qRes.active || isEagerProcessing ? '⟳ working' : 'waiting'} · Server: ${qRes.pending.length} · Eager: ${frontEndQ}`;
+            else qInfo.textContent = 'Queue: idle';
         }
 
-        // ── POPULATE DEBUG LOG UI ──
         if (debugBox && !debugBox.classList.contains('ttp-hidden')) {
             let debugText = [];
             if (qRes.active) debugText.push(`[SERVER] ACTIVE: ${qRes.active}`);
             qRes.pending.forEach((p, i) => debugText.push(`[SERVER] Wait ${i+1}: ${p}`));
-            
             if (currentEagerChunkJob) debugText.push(`[EAGER] ACTIVE: Chunk for ${currentEagerChunkJob.parentJob.akBase}`);
             eagerTtsQueue.forEach((q, i) => debugText.push(`[EAGER] Wait ${i+1}: Chunk for ${q.parentJob.akBase}`));
-
             debugBox.value = debugText.length > 0 ? debugText.join('\n') : 'No tasks running or queued.';
         }
 
-        // ── LIVE UI QUEUE DOT UPDATES ──
         for (const [ak, info] of pendingServerJobs.entries()) {
             if (!info.playerEl || !document.contains(info.playerEl)) continue;
             if (info.playerEl.dataset.currentAk !== ak) continue;
-
-            if (qRes.active === ak) {
-                playerStatus(info.playerEl, 'generating', 'Generating on server...');
-            } else if (qRes.pending.includes(ak)) {
-                playerStatus(info.playerEl, 'queued', 'Queued on server...');
-            }
+            if (qRes.active === ak) playerStatus(info.playerEl, 'generating', 'Generating on server...');
+            else if (qRes.pending.includes(ak)) playerStatus(info.playerEl, 'queued', 'Queued on server...');
 
             try {
                 const r = await apiFetch(`${API}/check/${encodeURIComponent(info.charName)}/${encodeURIComponent(info.chatId)}/${encodeURIComponent(ak)}`);
@@ -2128,7 +1692,4 @@ function init() {
     }, 2000);
 }
 
-// ── Execute on Ready ────────────────────────────────────────────────────────
-jQuery(async () => {
-    init();
-});
+jQuery(async () => { init(); });
